@@ -21,7 +21,7 @@ cd bmad-story-automation
 ### 2. Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install rich pyyaml
 ```
 
 ### 3. Run

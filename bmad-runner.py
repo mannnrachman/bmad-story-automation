@@ -177,6 +177,12 @@ class BMadRunner:
         self.last_message = ""
         self.claude_process = None
 
+        # Watchdog settings
+        self.last_progress_time = None
+        self.watchdog_timeout = 300  # 5 minutes without progress = hung
+        self.step_timeout = 600  # 10 minutes max per step
+        self.max_step_retries = 2  # Max retry attempts for incomplete steps
+
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         if hasattr(signal, 'SIGTERM'):
@@ -391,14 +397,18 @@ class BMadRunner:
         )
 
     def _monitor_progress(self, live: Live):
-        """Monitor progress file and update display"""
+        """Monitor progress file and update display with watchdog"""
         last_step = 0
         step_start_time = time.time()
+        self.last_progress_time = time.time()
 
         while not self.stop_event.is_set():
             progress = self._read_progress()
 
             if progress:
+                # Update last progress time (watchdog)
+                self.last_progress_time = time.time()
+
                 # Update story ID
                 if "story_id" in progress:
                     self.story_id = progress["story_id"]
@@ -433,6 +443,21 @@ class BMadRunner:
                     if self.step_status[curr_key] != "done":
                         self.step_status[curr_key] = "done"
                         self.step_times[curr_key] = time.time() - step_start_time
+
+            # === WATCHDOG CHECK ===
+            time_since_progress = time.time() - self.last_progress_time
+            if time_since_progress > self.watchdog_timeout:
+                self.last_message = f"[red]⚠ WATCHDOG: No progress for {int(time_since_progress)}s - possible hang![/red]"
+                # Kill hung Claude process
+                if self.claude_process and self.claude_process.poll() is None:
+                    self.console.print(f"\n[red]WATCHDOG: Terminating hung Claude process after {int(time_since_progress)}s[/red]")
+                    self.claude_process.terminate()
+                    try:
+                        self.claude_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.claude_process.kill()
+                    self.stop_event.set()
+                    break
 
             live.update(self._build_display())
             time.sleep(0.5)
@@ -715,6 +740,131 @@ Only update tracking - do NOT modify any source code.
         # Clear progress file
         Path(PROGRESS_FILE).unlink(missing_ok=True)
 
+    def _verify_all_steps_completed(self) -> tuple:
+        """Check if all 11 steps are marked as Done.
+        Returns: (all_done: bool, completed_count: int, missing_steps: list)
+        """
+        completed = []
+        missing = []
+        for step in STEPS:
+            if self.step_status.get(step["key"]) == "done":
+                completed.append(step)
+            else:
+                missing.append(step)
+        return len(missing) == 0, len(completed), missing
+
+    def _get_retry_prompt_for_steps(self, missing_steps: list, story_id: str) -> str:
+        """Generate a focused prompt to retry only the missing steps."""
+        step_instructions = []
+        for step in missing_steps:
+            step_id = step["id"]
+
+            if step_id == 1:
+                step_instructions.append(f"STEP {step_id}: Read _bmad-output/implementation-artifacts/sprint-status.yaml and confirm story {story_id}")
+            elif step_id == 2:
+                step_instructions.append(f"STEP {step_id}: Call /bmad:bmm:workflows:create-story with {story_id} to create the story file")
+            elif step_id == 3:
+                step_instructions.append(f"STEP {step_id}: Call /bmad:bmm:workflows:dev-story with {story_id} to implement the code")
+            elif step_id == 4:
+                step_instructions.append(f"STEP {step_id}: Run tests (pnpm test or npm test)")
+            elif step_id == 5:
+                step_instructions.append(f"STEP {step_id}: Call /bmad:bmm:workflows:code-review to review the code")
+            elif step_id == 6:
+                step_instructions.append(f"STEP {step_id}: Fix any issues found in code review")
+            elif step_id == 7:
+                step_instructions.append(f"STEP {step_id}: Run tests again until ALL PASS")
+            elif step_id == 8:
+                step_instructions.append(f"STEP {step_id}: Update story file: set status to 'done', mark all tasks [x], fill Dev Agent Record")
+            elif step_id == 9:
+                step_instructions.append(f"STEP {step_id}: Update _bmad-output/implementation-artifacts/sprint-status.yaml: mark {story_id} as 'done'")
+            elif step_id == 10:
+                step_instructions.append(f"STEP {step_id}: Update _bmad-output/planning-artifacts/bmm-workflow-status.yaml with completion info")
+            elif step_id == 11:
+                short_id = "-".join(story_id.split("-")[:2]) if story_id and story_id != "..." else "X-X"
+                step_instructions.append(f"STEP {step_id}: Git add -A and commit with message: \"feat(story): complete {short_id}\"")
+
+        prompt = f'''CONTINUE INCOMPLETE STORY: {story_id}
+
+The previous execution stopped early. Complete ONLY these remaining steps:
+
+After completing EACH step, write progress to .claude/bmad-progress.json:
+{{"story_id": "{story_id}", "current_step": N, "status": "done", "message": "what you did"}}
+
+{chr(10).join(step_instructions)}
+
+IMPORTANT: Complete ALL listed steps. Do not stop early. Do not ask questions - make reasonable decisions.
+'''
+        return prompt
+
+    def _run_claude_retry(self, prompt: str) -> int:
+        """Run Claude with a retry prompt for missing steps."""
+        try:
+            self.claude_process = subprocess.Popen(
+                ["claude", "--dangerously-skip-permissions", "-p", prompt],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+
+            while True:
+                line = self.claude_process.stdout.readline()
+                if not line and self.claude_process.poll() is not None:
+                    break
+
+            return self.claude_process.returncode or 0
+        except Exception as e:
+            self.console.print(f"[red]Error running Claude retry: {e}[/red]")
+            return 1
+
+    def _retry_missing_steps(self, missing_steps: list, story_id: str, max_retries: int = None) -> bool:
+        """Retry only the missing steps with focused prompts."""
+        if max_retries is None:
+            max_retries = self.max_step_retries
+
+        for attempt in range(max_retries):
+            self.console.print(f"\n[yellow]🔄 Retry attempt {attempt + 1}/{max_retries} for {len(missing_steps)} missing steps...[/yellow]")
+
+            # Show which steps are missing
+            for step in missing_steps:
+                self.console.print(f"  [dim]• Step {step['id']}: {step['name']}[/dim]")
+
+            # Generate focused retry prompt
+            retry_prompt = self._get_retry_prompt_for_steps(missing_steps, story_id)
+
+            # Clear progress file for retry monitoring
+            Path(PROGRESS_FILE).unlink(missing_ok=True)
+
+            # Run retry with monitoring
+            with Live(self._build_display(), console=self.console, refresh_per_second=2) as live:
+                monitor_thread = Thread(target=self._monitor_progress, args=(live,), daemon=True)
+                monitor_thread.start()
+
+                exit_code = self._run_claude_retry(retry_prompt)
+
+                self.stop_event.set()
+                monitor_thread.join(timeout=1)
+                self.stop_event.clear()
+
+            # Check if steps are now complete
+            all_done, completed_count, still_missing = self._verify_all_steps_completed()
+
+            if all_done:
+                self.console.print(f"[green]✓ All {len(STEPS)} steps now complete![/green]")
+                return True
+
+            if len(still_missing) < len(missing_steps):
+                self.console.print(f"[yellow]Progress: {len(missing_steps) - len(still_missing)} steps completed, {len(still_missing)} still missing[/yellow]")
+                missing_steps = still_missing
+            else:
+                self.console.print(f"[yellow]No progress on retry attempt {attempt + 1}[/yellow]")
+
+            # Check stop signal
+            if Path(STOP_FILE).exists() or self.stop_event.is_set():
+                return False
+
+        return False
+
     def run(self):
         """Main run loop"""
         self._ensure_dirs()
@@ -790,8 +940,22 @@ Only update tracking - do NOT modify any source code.
 
             # Show iteration result
             self.console.print()
-            if exit_code == 0:
-                self.console.print(f"[green]✓ Iteration {iteration} completed successfully[/green]")
+
+            # === STEP COMPLETION VERIFICATION ===
+            all_done, completed_count, missing_steps = self._verify_all_steps_completed()
+
+            if exit_code == 0 and all_done:
+                self.console.print(f"[green]✓ Iteration {iteration} completed successfully ({completed_count}/{len(STEPS)} steps)[/green]")
+            elif exit_code == 0 and not all_done:
+                self.console.print(f"[yellow]⚠ Iteration {iteration} INCOMPLETE: {completed_count}/{len(STEPS)} steps done[/yellow]")
+
+                # Attempt to retry missing steps
+                if not self.demo_mode and self.story_id and self.story_id != "...":
+                    retry_success = self._retry_missing_steps(missing_steps, self.story_id)
+                    if retry_success:
+                        self.console.print(f"[green]✓ Missing steps completed via retry![/green]")
+                    else:
+                        self.console.print(f"[red]✗ Could not complete all steps after retries[/red]")
             else:
                 self.console.print(f"[yellow]⚠ Iteration {iteration} completed with exit code {exit_code}[/yellow]")
 
@@ -895,10 +1059,24 @@ To stop the automation:
         action="store_true",
         help="Run in demo mode (simulated progress, no Claude)"
     )
+    parser.add_argument(
+        "--watchdog-timeout",
+        type=int,
+        default=300,
+        help="Seconds without progress before killing hung process (default: 300 = 5 min)"
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Max retry attempts for incomplete steps (default: 2)"
+    )
 
     args = parser.parse_args()
 
     runner = BMadRunner(max_iterations=args.iterations, demo_mode=args.demo, story_id=args.story)
+    runner.watchdog_timeout = args.watchdog_timeout
+    runner.max_step_retries = args.max_retries
     runner.run()
 
 
