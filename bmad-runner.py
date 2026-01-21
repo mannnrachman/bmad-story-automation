@@ -43,6 +43,17 @@ PROGRESS_FILE = ".claude/bmad-progress.json"
 STOP_FILE = ".claude/bmad-stop"
 TRACKING_FILE = ".claude/bmad-automation.tracking.json"
 
+# Files that should be in .gitignore (temp files that shouldn't be committed)
+GITIGNORE_ENTRIES = [
+    "# BMAD Automation (auto-added)",
+    "__pycache__/",
+    "*.py[cod]",
+    ".claude/bmad-progress.json",
+    ".claude/bmad-automation.tracking.json",
+    ".claude/bmad-verifier-progress.json",
+    ".claude/bmad-stop",
+]
+
 STEPS = [
     {"id": 1, "name": "Read workflow status", "key": "read_status"},
     {"id": 2, "name": "Create story", "key": "create_story"},
@@ -95,7 +106,8 @@ STEP 9: Update _bmad-output/implementation-artifacts/sprint-status.yaml: mark ST
 STEP 10: Update _bmad-output/planning-artifacts/bmm-workflow-status.yaml with completion info
          Write progress
 
-STEP 11: Git add -A and commit with message: "feat: complete STORY_ID"
+STEP 11: Git add -A and commit with message: "feat(story): complete SHORT_ID"
+         (SHORT_ID is like "5-9" - the first two parts of STORY_ID)
          Write progress
 
 IMPORTANT: Complete ALL 11 steps. Do not stop after creating the story.
@@ -139,7 +151,7 @@ STEP 9: Update _bmad-output/implementation-artifacts/sprint-status.yaml: mark {s
 STEP 10: Update _bmad-output/planning-artifacts/bmm-workflow-status.yaml with completion info
          Write progress
 
-STEP 11: Git add -A and commit with message: "feat: complete {story_id}"
+STEP 11: Git add -A and commit with message: "feat(story): complete {story_id}"
          Write progress
 
 IMPORTANT: Complete ALL 11 steps. Do not stop after creating the story.
@@ -186,11 +198,36 @@ class BMadRunner:
             except:
                 pass
 
+    def _ensure_gitignore(self):
+        """Ensure .gitignore has entries for temp files (auto-add if missing)"""
+        gitignore_path = Path(".gitignore")
+
+        # Read existing content
+        existing_content = ""
+        if gitignore_path.exists():
+            existing_content = gitignore_path.read_text(encoding="utf-8")
+
+        # Check which entries are missing
+        missing_entries = []
+        for entry in GITIGNORE_ENTRIES:
+            if entry not in existing_content:
+                missing_entries.append(entry)
+
+        # Add missing entries
+        if missing_entries:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
+                if existing_content and not existing_content.endswith("\n"):
+                    f.write("\n")
+                f.write("\n".join(missing_entries) + "\n")
+            self.console.print(f"[dim]Added {len(missing_entries)} entries to .gitignore[/dim]")
+
     def _ensure_dirs(self):
-        """Ensure .claude directory exists"""
+        """Ensure .claude directory exists and .gitignore is configured"""
         Path(".claude").mkdir(exist_ok=True)
         # Remove old stop file
         Path(STOP_FILE).unlink(missing_ok=True)
+        # Ensure temp files are in .gitignore
+        self._ensure_gitignore()
 
     def _read_progress(self) -> dict:
         """Read progress from JSON file"""
@@ -516,16 +553,17 @@ class BMadRunner:
 
     def _run_fix_story(self, story_id: str) -> int:
         """Run Claude to fix story tracking files (code is done, just update status)"""
+        # Story files are named like "5-9-migration-summary-report.md", not just "5-9.md"
         prompt = f'''Fix the tracking files for story {story_id}. The code is already implemented, but tracking files need updating.
 
-1. Read the story file at _bmad-output/implementation-artifacts/{story_id}.md
+1. Find the story file in _bmad-output/implementation-artifacts/ that starts with "{story_id}-" (e.g., {story_id}-*.md)
 2. Update the story file:
    - Set Status: done
    - Mark ALL tasks as completed: - [x]
    - Fill the Dev Agent Record section if empty
 3. Update _bmad-output/implementation-artifacts/sprint-status.yaml:
-   - Set {story_id}: done
-4. Git commit with message: "fix: update tracking for {story_id}"
+   - Find the entry that starts with "{story_id}-" and set it to: done
+4. Git commit with message: "fix(story): update {story_id} tracking"
 
 Only update tracking - do NOT modify any source code.
 '''
@@ -553,7 +591,7 @@ Only update tracking - do NOT modify any source code.
 4. Run tests until they pass
 5. Update story file: set Status: done, mark all tasks [x]
 6. Update sprint-status.yaml: set {story_id}: done
-7. Git commit with message: "feat: complete {story_id}"
+7. Git commit with message: "feat(story): complete {story_id}"
 '''
 
         try:

@@ -41,6 +41,17 @@ SPRINT_STATUS_FILE = "_bmad-output/implementation-artifacts/sprint-status.yaml"
 STORY_FOLDER = "_bmad-output/implementation-artifacts"
 PROGRESS_FILE = ".claude/bmad-verifier-progress.json"
 
+# Files that should be in .gitignore (temp files that shouldn't be committed)
+GITIGNORE_ENTRIES = [
+    "# BMAD Automation (auto-added)",
+    "__pycache__/",
+    "*.py[cod]",
+    ".claude/bmad-progress.json",
+    ".claude/bmad-automation.tracking.json",
+    ".claude/bmad-verifier-progress.json",
+    ".claude/bmad-stop",
+]
+
 # Quick validation steps (no Claude)
 QUICK_STEPS = [
     {"id": 1, "name": "Story file exists", "key": "file_exists"},
@@ -59,6 +70,29 @@ class BMadVerifier:
         self.interactive = interactive  # Show action menu after verify
         self.sprint_data = {}
         self.results = []
+
+    def _ensure_gitignore(self):
+        """Ensure .gitignore has entries for temp files (auto-add if missing)"""
+        gitignore_path = Path(".gitignore")
+
+        # Read existing content
+        existing_content = ""
+        if gitignore_path.exists():
+            existing_content = gitignore_path.read_text(encoding="utf-8")
+
+        # Check which entries are missing
+        missing_entries = []
+        for entry in GITIGNORE_ENTRIES:
+            if entry not in existing_content:
+                missing_entries.append(entry)
+
+        # Add missing entries
+        if missing_entries:
+            with open(gitignore_path, "a", encoding="utf-8") as f:
+                if existing_content and not existing_content.endswith("\n"):
+                    f.write("\n")
+                f.write("\n".join(missing_entries) + "\n")
+            self.console.print(f"[dim]Added {len(missing_entries)} entries to .gitignore[/dim]")
 
     def _load_sprint_status(self) -> dict:
         """Load sprint-status.yaml"""
@@ -149,11 +183,12 @@ class BMadVerifier:
         }
         result["tasks"] = self._parse_tasks_from_story(content)
 
-        # Step 4: Git commit (use pipe grep for accuracy)
+        # Step 4: Git commit (search for standardized commit format)
         try:
             short_id = "-".join(story_id.split("-")[:2])
+            # Search for standardized format: "feat(story): complete 5-9" or "fix(story): update 5-9"
             git_result = subprocess.run(
-                f'git log --oneline | grep "{short_id}-"',
+                f'git log --oneline | grep -E "(feat|fix)\\(story\\):.*{short_id}"',
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -404,7 +439,8 @@ IMPORTANT:
             recommendations.append(f"[yellow]→[/yellow] Mark all tasks as completed: [bold]- [x][/bold]")
 
         if not steps.get("git_commit", {}).get("passed"):
-            recommendations.append(f"[yellow]→[/yellow] Create git commit: [bold]git commit -m \"feat: complete {story_id}\"[/bold]")
+            short_id = "-".join(story_id.split("-")[:2])
+            recommendations.append(f"[yellow]→[/yellow] Create git commit: [bold]git commit -m \"feat(story): complete {short_id}\"[/bold]")
 
         if not steps.get("sprint_done", {}).get("passed"):
             recommendations.append(f"[yellow]→[/yellow] Update sprint-status.yaml: set [bold]{story_id}: done[/bold]")
@@ -603,7 +639,7 @@ Complete all implementation tasks in the story.
    - Fill the Dev Agent Record section if empty
 3. Update _bmad-output/implementation-artifacts/sprint-status.yaml:
    - Set {story_id}: done
-4. Git commit with message: "fix: update tracking for {story_id}"
+4. Git commit with message: "fix(story): update {story_id} tracking"
 
 Only update tracking - do NOT modify any source code.
 '''
@@ -715,6 +751,9 @@ Only update tracking - do NOT modify any source code.
 
     def run(self):
         """Main run method"""
+        # Ensure temp files are in .gitignore
+        self._ensure_gitignore()
+
         self.console.print()
 
         mode_parts = []
