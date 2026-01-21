@@ -743,14 +743,34 @@ Only update tracking - do NOT modify any source code.
     def _verify_all_steps_completed(self) -> tuple:
         """Check if all 11 steps are marked as Done.
         Returns: (all_done: bool, completed_count: int, missing_steps: list)
+
+        Smart detection: If step 5 (code review) is done and step 7+ are done,
+        then step 6 (fix issues) is considered skipped (no issues found).
         """
         completed = []
         missing = []
+
+        # Check for skippable steps
+        step_5_done = self.step_status.get("code_review") == "done"
+        step_7_done = self.step_status.get("run_tests_final") == "done"
+
         for step in STEPS:
-            if self.step_status.get(step["key"]) == "done":
+            step_key = step["key"]
+            is_done = self.step_status.get(step_key) == "done"
+
+            # Smart skip detection for Step 6 (fix_issues)
+            # If code review done AND tests passed, no issues to fix
+            if step_key == "fix_issues" and not is_done:
+                if step_5_done and step_7_done:
+                    # Mark as done (skipped - no issues)
+                    self.step_status[step_key] = "done"
+                    is_done = True
+
+            if is_done:
                 completed.append(step)
             else:
                 missing.append(step)
+
         return len(missing) == 0, len(completed), missing
 
     def _get_retry_prompt_for_steps(self, missing_steps: list, story_id: str) -> str:
