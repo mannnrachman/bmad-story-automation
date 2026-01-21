@@ -492,8 +492,8 @@ class BMadSuite:
         # Overview
         self.console.print(Panel(
             "[bold cyan]BMAD Automation Suite[/bold cyan]\n\n"
-            "Unified CLI untuk menjalankan otomasi BMAD workflow.\n"
-            "Menggabungkan Runner (create & develop) dan Verifier (validate).",
+            "Unified CLI for running BMAD workflow automation.\n"
+            "Combines Runner (create & develop) and Verifier (validate).",
             box=box.ROUNDED,
             border_style="cyan"
         ))
@@ -506,27 +506,27 @@ class BMadSuite:
         cmd_table.add_column("Description", width=40)
 
         cmd_table.add_row("python bmad.py", "Interactive menu")
-        cmd_table.add_row("python bmad.py status", "Lihat sprint status")
-        cmd_table.add_row("python bmad.py run 5-2", "Jalankan story 5-2")
-        cmd_table.add_row("python bmad.py run 5-2 -c 3", "Jalankan 5-2, 5-3, 5-4 (3 stories)")
-        cmd_table.add_row("python bmad.py run -e 5", "Jalankan semua story di epic 5")
-        cmd_table.add_row("python bmad.py run -c 5", "Auto-pick 5 story dari backlog")
+        cmd_table.add_row("python bmad.py status", "View sprint status")
+        cmd_table.add_row("python bmad.py run 5-2", "Run story 5-2")
+        cmd_table.add_row("python bmad.py run 5-2 -c 3", "Run 5-2, 5-3, 5-4 (3 stories)")
+        cmd_table.add_row("python bmad.py run -e 5", "Run all stories in epic 5")
+        cmd_table.add_row("python bmad.py run -c 5", "Auto-pick 5 stories from backlog")
         cmd_table.add_row("python bmad.py verify 5-2", "Quick verify story 5-2")
-        cmd_table.add_row("python bmad.py verify 5-2 -d", "Deep verify dengan Claude")
+        cmd_table.add_row("python bmad.py verify 5-2 -d", "Deep verify with Claude")
         cmd_table.add_row("python bmad.py verify 5-2 -d -i", "Deep verify + interactive fix")
 
         self.console.print(cmd_table)
 
         # Workflow explanation
         self.console.print()
-        self.console.print("[bold]🔄 Workflow BMAD[/bold]")
+        self.console.print("[bold]🔄 BMAD Workflow[/bold]")
         flow_table = Table(box=box.SIMPLE, show_header=False)
         flow_table.add_column("Step", width=5)
         flow_table.add_column("Description", width=60)
 
-        flow_table.add_row("[cyan]1[/cyan]", "[bold]Runner[/bold] - Create story dari backlog, develop code, commit")
-        flow_table.add_row("[cyan]2[/cyan]", "[bold]Verifier[/bold] - Validasi apakah story selesai dengan benar")
-        flow_table.add_row("[cyan]3[/cyan]", "[bold]Fix/Dev[/bold] - Jika ada masalah, jalankan fix atau dev lagi")
+        flow_table.add_row("[cyan]1[/cyan]", "[bold]Runner[/bold] - Create story from backlog, develop code, commit")
+        flow_table.add_row("[cyan]2[/cyan]", "[bold]Verifier[/bold] - Validate if story completed correctly")
+        flow_table.add_row("[cyan]3[/cyan]", "[bold]Fix/Dev[/bold] - If issues found, run fix or dev again")
 
         self.console.print(flow_table)
 
@@ -534,11 +534,11 @@ class BMadSuite:
         self.console.print()
         self.console.print(Panel(
             "[bold]💡 Tips:[/bold]\n\n"
-            "• Gunakan [cyan]--demo[/cyan] untuk test tanpa Claude (simulasi)\n"
-            "• Gunakan [cyan]-i[/cyan] (interactive) di verifier untuk action langsung\n"
-            "• Deep check ([cyan]-d[/cyan]) memverifikasi code benar-benar ada\n"
-            "• Ctrl+C untuk stop kapan saja\n"
-            "• Buat file [cyan].claude/bmad-stop[/cyan] untuk stop runner",
+            "• Use [cyan]--demo[/cyan] to test without Claude (simulation)\n"
+            "• Use [cyan]-i[/cyan] (interactive) in verifier for direct actions\n"
+            "• Deep check ([cyan]-d[/cyan]) verifies code actually exists\n"
+            "• Ctrl+C to stop anytime\n"
+            "• Create [cyan].claude/bmad-stop[/cyan] file to stop runner gracefully",
             box=box.ROUNDED,
             border_style="yellow"
         ))

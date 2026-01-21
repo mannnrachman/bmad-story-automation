@@ -161,10 +161,11 @@ IMPORTANT: Complete ALL 11 steps. Do not stop after creating the story.
 class BMadRunner:
     def __init__(self, max_iterations: int = 5, demo_mode: bool = False, story_id: str = None):
         self.console = Console()
-        # If specific story selected, override to single iteration
-        self.max_iterations = 1 if story_id else max_iterations
+        # Support both single story and story + continue modes
+        self.max_iterations = max_iterations
         self.demo_mode = demo_mode
-        self.manual_story_id = story_id  # Manual story selection
+        self.start_story_id = story_id  # Starting story (can continue from here)
+        self.current_story_id = story_id  # Current story being processed
         self.current_iteration = 0
         self.current_step = 0
         self.story_id = "..."
@@ -180,6 +181,20 @@ class BMadRunner:
         signal.signal(signal.SIGINT, self._signal_handler)
         if hasattr(signal, 'SIGTERM'):
             signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _get_next_story_id(self, current_id: str) -> str:
+        """Calculate the next story ID (e.g., 5-10 -> 5-11)"""
+        if not current_id:
+            return None
+        parts = current_id.split("-")
+        if len(parts) >= 2:
+            try:
+                epic = parts[0]
+                story_num = int(parts[1])
+                return f"{epic}-{story_num + 1}"
+            except ValueError:
+                return None
+        return None
 
     def _signal_handler(self, signum, frame):
         """Handle Ctrl+C gracefully"""
@@ -425,9 +440,9 @@ class BMadRunner:
     def _run_claude(self) -> int:
         """Run Claude with the prompt"""
         try:
-            # Use manual or auto prompt
-            if self.manual_story_id:
-                prompt = CLAUDE_PROMPT_MANUAL.format(story_id=self.manual_story_id)
+            # Use current story or auto prompt
+            if self.current_story_id:
+                prompt = CLAUDE_PROMPT_MANUAL.format(story_id=self.current_story_id)
             else:
                 prompt = CLAUDE_PROMPT_AUTO
 
@@ -456,9 +471,9 @@ class BMadRunner:
 
     def _run_demo(self) -> int:
         """Run demo mode - simulate progress without Claude"""
-        # Use manual story or pick random for demo
-        if self.manual_story_id:
-            story_id = self.manual_story_id
+        # Use current story or pick random for demo
+        if self.current_story_id:
+            story_id = self.current_story_id
         else:
             demo_stories = [
                 "1-1-initialize-monorepo", "1-2-configure-typescript",
@@ -482,7 +497,7 @@ class BMadRunner:
         ]
 
         # Pick a random story for this iteration
-        if not self.manual_story_id:
+        if not self.current_story_id:
             story_id = random.choice(demo_stories)
 
         # Simulate each step with random delays
@@ -707,15 +722,15 @@ Only update tracking - do NOT modify any source code.
 
         # Show startup banner
         mode_text = "[yellow]DEMO MODE[/yellow] (simulated)" if self.demo_mode else "[green]PRODUCTION MODE[/green]"
-        story_text = f"[bold cyan]{self.manual_story_id}[/bold cyan]" if self.manual_story_id else "[dim]Auto (next backlog)[/dim]"
-        iter_text = "1 (single story)" if self.manual_story_id else str(self.max_iterations)
+        story_text = f"[bold cyan]{self.start_story_id}[/bold cyan] (+ continue)" if self.start_story_id else "[dim]Auto (next backlog)[/dim]"
+        iter_text = str(self.max_iterations)
 
         self.console.print()
         self.console.print(Panel(
             f"[bold cyan]BMAD Story Automation[/bold cyan]\n\n"
             f"[white]Mode:[/white] {mode_text}\n"
-            f"[white]Story:[/white] {story_text}\n"
-            f"[white]Max Iterations:[/white] [bold]{iter_text}[/bold]\n"
+            f"[white]Start Story:[/white] {story_text}\n"
+            f"[white]Total Stories:[/white] [bold]{iter_text}[/bold]\n"
             f"[white]Started:[/white] [bold]{self.start_time.strftime('%Y-%m-%d %H:%M:%S')}[/bold]\n\n"
             "[dim]Press Ctrl+C to stop at any time[/dim]",
             box=box.DOUBLE,
@@ -724,10 +739,7 @@ Only update tracking - do NOT modify any source code.
         self.console.print()
         time.sleep(2)
 
-        # If manual story, only run 1 iteration
-        max_iter = 1 if self.manual_story_id else self.max_iterations
-
-        for iteration in range(1, max_iter + 1):
+        for iteration in range(1, self.max_iterations + 1):
             # Check stop condition
             if Path(STOP_FILE).exists() or self.stop_event.is_set():
                 self.console.print("[yellow]Stop requested. Exiting...[/yellow]")
@@ -737,10 +749,15 @@ Only update tracking - do NOT modify any source code.
             self._reset_iteration()
             self.iteration_start_time = datetime.now()
 
+            # Show current story being processed
+            if self.current_story_id:
+                self.console.print(f"\n[bold cyan]▶ Processing story: {self.current_story_id}[/bold cyan]")
+
             # Save tracking info
             tracking = {
                 "iteration": iteration,
                 "max_iterations": self.max_iterations,
+                "current_story": self.current_story_id,
                 "started_at": self.iteration_start_time.isoformat(),
                 "status": "running"
             }
@@ -811,6 +828,13 @@ Only update tracking - do NOT modify any source code.
                 self.console.print("[yellow]Stop file detected. Exiting...[/yellow]")
                 Path(STOP_FILE).unlink(missing_ok=True)
                 break
+
+            # Increment story ID for next iteration (if in continue mode)
+            if self.current_story_id and iteration < self.max_iterations:
+                next_story = self._get_next_story_id(self.current_story_id)
+                if next_story:
+                    self.current_story_id = next_story
+                    self.console.print(f"[dim]Next story: {next_story}[/dim]")
 
             # Delay before next iteration
             if iteration < self.max_iterations:
