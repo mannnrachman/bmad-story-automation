@@ -6,6 +6,7 @@ Cross-platform (Windows/Linux/Mac)
 Usage:
     python bmad-runner.py                    # Default 5 iterations
     python bmad-runner.py --iterations 3    # Custom iterations
+    python bmad-runner.py --story 5-2       # Process specific story
     python bmad-runner.py --demo            # Demo mode (simulated, no Claude)
     python bmad-runner.py --help            # Show help
 """
@@ -58,7 +59,7 @@ STEPS = [
 
 # The prompt that instructs Claude to write progress
 # Based on working PowerShell script - simple and direct
-CLAUDE_PROMPT = '''EXECUTE ALL STEPS IN ORDER - DO NOT STOP EARLY.
+CLAUDE_PROMPT_AUTO = '''EXECUTE ALL STEPS IN ORDER - DO NOT STOP EARLY.
 
 After completing EACH step, write progress to .claude/bmad-progress.json:
 {"story_id": "X", "current_step": N, "status": "done", "message": "what you did"}
@@ -100,12 +101,58 @@ STEP 11: Git add -A and commit with message: "feat: complete STORY_ID"
 IMPORTANT: Complete ALL 11 steps. Do not stop after creating the story.
 '''
 
+# Prompt for manual story selection
+CLAUDE_PROMPT_MANUAL = '''EXECUTE ALL STEPS IN ORDER - DO NOT STOP EARLY.
+
+After completing EACH step, write progress to .claude/bmad-progress.json:
+{{"story_id": "{story_id}", "current_step": N, "status": "done", "message": "what you did"}}
+
+STORY_ID = {story_id}
+
+STEP 1: Confirm story {story_id} exists in _bmad-output/implementation-artifacts/sprint-status.yaml
+        Write progress with story_id
+
+STEP 2: Call /bmad:bmm:workflows:create-story with {story_id} to create the story file
+        Write progress
+
+STEP 3: Call /bmad:bmm:workflows:dev-story with {story_id} to implement the code
+        Write progress
+
+STEP 4: Run tests (pnpm test or npm test or the appropriate test command)
+        Write progress
+
+STEP 5: Call /bmad:bmm:workflows:code-review to review the code
+        Write progress
+
+STEP 6: Fix any issues found in code review
+        Write progress
+
+STEP 7: Run tests again until ALL PASS
+        Write progress
+
+STEP 8: Update story file: set status to "done", mark all tasks [x], fill Dev Agent Record
+        Write progress
+
+STEP 9: Update _bmad-output/implementation-artifacts/sprint-status.yaml: mark {story_id} as "done"
+        Write progress
+
+STEP 10: Update _bmad-output/planning-artifacts/bmm-workflow-status.yaml with completion info
+         Write progress
+
+STEP 11: Git add -A and commit with message: "feat: complete {story_id}"
+         Write progress
+
+IMPORTANT: Complete ALL 11 steps. Do not stop after creating the story.
+'''
+
 
 class BMadRunner:
-    def __init__(self, max_iterations: int = 5, demo_mode: bool = False):
+    def __init__(self, max_iterations: int = 5, demo_mode: bool = False, story_id: str = None):
         self.console = Console()
-        self.max_iterations = max_iterations
+        # If specific story selected, override to single iteration
+        self.max_iterations = 1 if story_id else max_iterations
         self.demo_mode = demo_mode
+        self.manual_story_id = story_id  # Manual story selection
         self.current_iteration = 0
         self.current_step = 0
         self.story_id = "..."
@@ -341,8 +388,14 @@ class BMadRunner:
     def _run_claude(self) -> int:
         """Run Claude with the prompt"""
         try:
+            # Use manual or auto prompt
+            if self.manual_story_id:
+                prompt = CLAUDE_PROMPT_MANUAL.format(story_id=self.manual_story_id)
+            else:
+                prompt = CLAUDE_PROMPT_AUTO
+
             self.claude_process = subprocess.Popen(
-                ["claude", "--dangerously-skip-permissions", "-p", CLAUDE_PROMPT],
+                ["claude", "--dangerously-skip-permissions", "-p", prompt],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -366,11 +419,15 @@ class BMadRunner:
 
     def _run_demo(self) -> int:
         """Run demo mode - simulate progress without Claude"""
-        # Simulated story IDs for demo
-        demo_stories = [
-            "1-1-initialize-monorepo", "1-2-configure-typescript",
-            "2-1-database-connection", "2-2-table-discovery"
-        ]
+        # Use manual story or pick random for demo
+        if self.manual_story_id:
+            story_id = self.manual_story_id
+        else:
+            demo_stories = [
+                "1-1-initialize-monorepo", "1-2-configure-typescript",
+                "2-1-database-connection", "2-2-table-discovery"
+            ]
+            story_id = random.choice(demo_stories)
 
         # Demo messages for each step (11 steps now)
         demo_messages = [
@@ -388,7 +445,8 @@ class BMadRunner:
         ]
 
         # Pick a random story for this iteration
-        story_id = random.choice(demo_stories)
+        if not self.manual_story_id:
+            story_id = random.choice(demo_stories)
 
         # Simulate each step with random delays
         for step_num in range(1, len(STEPS) + 1):
@@ -431,6 +489,170 @@ class BMadRunner:
 
         return 0
 
+    def _call_verifier(self, story_id: str, deep: bool = False) -> dict:
+        """Call bmad-verifier.py and parse JSON output"""
+        verifier_script = Path(__file__).parent / "bmad-verifier.py"
+        cmd = [sys.executable, str(verifier_script), story_id, "--json"]
+        if deep:
+            cmd.append("--deep")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180 if deep else 30
+            )
+            if result.stdout:
+                return json.loads(result.stdout.strip())
+        except subprocess.TimeoutExpired:
+            return {"error": "Verifier timeout", "passed": False}
+        except json.JSONDecodeError:
+            return {"error": "Invalid JSON from verifier", "passed": False}
+        except Exception as e:
+            return {"error": str(e), "passed": False}
+
+        return {"error": "No output from verifier", "passed": False}
+
+    def _run_fix_story(self, story_id: str) -> int:
+        """Run Claude to fix story tracking files (code is done, just update status)"""
+        prompt = f'''Fix the tracking files for story {story_id}. The code is already implemented, but tracking files need updating.
+
+1. Read the story file at _bmad-output/implementation-artifacts/{story_id}.md
+2. Update the story file:
+   - Set Status: done
+   - Mark ALL tasks as completed: - [x]
+   - Fill the Dev Agent Record section if empty
+3. Update _bmad-output/implementation-artifacts/sprint-status.yaml:
+   - Set {story_id}: done
+4. Git commit with message: "fix: update tracking for {story_id}"
+
+Only update tracking - do NOT modify any source code.
+'''
+
+        try:
+            self.console.print(f"[yellow]Running fix for {story_id}...[/yellow]")
+            process = subprocess.run(
+                ["claude", "--dangerously-skip-permissions", "-p", prompt],
+                capture_output=True,
+                text=True,
+                timeout=180
+            )
+            return process.returncode or 0
+        except Exception as e:
+            self.console.print(f"[red]Error running fix: {e}[/red]")
+            return 1
+
+    def _run_dev_story(self, story_id: str) -> int:
+        """Run Claude to develop/implement a story"""
+        prompt = f'''Implement story {story_id}.
+
+1. Read the story file at _bmad-output/implementation-artifacts/{story_id}.md
+2. Implement ALL tasks described in the story
+3. Write tests for the implementation
+4. Run tests until they pass
+5. Update story file: set Status: done, mark all tasks [x]
+6. Update sprint-status.yaml: set {story_id}: done
+7. Git commit with message: "feat: complete {story_id}"
+'''
+
+        try:
+            self.console.print(f"[yellow]Running dev for {story_id}...[/yellow]")
+            process = subprocess.run(
+                ["claude", "--dangerously-skip-permissions", "-p", prompt],
+                capture_output=True,
+                text=True,
+                timeout=600  # 10 min for dev
+            )
+            return process.returncode or 0
+        except Exception as e:
+            self.console.print(f"[red]Error running dev: {e}[/red]")
+            return 1
+
+    def _verify_and_fix_loop(self, story_id: str, max_retries: int = 3) -> bool:
+        """Verify story completion using verifier and fix/retry if needed."""
+        for attempt in range(max_retries):
+            self.console.print()
+            self.console.print(Panel(
+                f"[bold]🔍 Verification Attempt {attempt + 1}/{max_retries}[/bold]\n\n"
+                f"Story: [cyan]{story_id}[/cyan]",
+                box=box.ROUNDED,
+                border_style="yellow"
+            ))
+
+            # Step 1: Quick verify using verifier
+            self.console.print("[dim]Running quick verification...[/dim]")
+            quick_result = self._call_verifier(story_id, deep=False)
+
+            if quick_result.get("error"):
+                self.console.print(f"[yellow]Verifier error: {quick_result['error']}[/yellow]")
+                continue
+
+            if quick_result.get("passed"):
+                self.console.print("[green]✓ Quick verification PASSED![/green]")
+                return True
+
+            # Show what failed
+            self.console.print("[yellow]Quick verification found issues:[/yellow]")
+            checks = quick_result.get("checks", {})
+            for name, passed in checks.items():
+                icon = "[green]✓[/green]" if passed else "[red]✗[/red]"
+                self.console.print(f"  {icon} {name}")
+
+            # If file doesn't exist, cannot continue
+            if not checks.get("file_exists"):
+                self.console.print("[red]Story file doesn't exist - cannot verify[/red]")
+                return False
+
+            # Step 2: Deep verify to check if code is actually implemented
+            self.console.print()
+            self.console.print("[dim]Running deep verification with Claude...[/dim]")
+            deep_result = self._call_verifier(story_id, deep=True)
+
+            if deep_result.get("error"):
+                self.console.print(f"[yellow]Deep verify error: {deep_result['error']}[/yellow]")
+                # Try fix anyway
+                self.console.print("[dim]Attempting fix despite error...[/dim]")
+                self._run_fix_story(story_id)
+                continue
+
+            if deep_result.get("code_implemented"):
+                # Code is implemented! Just need to fix tracking files
+                self.console.print("[green]✓ Code is implemented![/green]")
+                if deep_result.get("deep_summary"):
+                    self.console.print(f"[dim]{deep_result['deep_summary']}[/dim]")
+                self.console.print()
+                self.console.print("[yellow]Fixing tracking files...[/yellow]")
+
+                fix_result = self._run_fix_story(story_id)
+                if fix_result == 0:
+                    # Verify again
+                    final_check = self._call_verifier(story_id, deep=False)
+                    if final_check.get("passed"):
+                        self.console.print("[green]✓ Fix successful![/green]")
+                        return True
+                    else:
+                        self.console.print("[yellow]Fix completed but verification still failing[/yellow]")
+            else:
+                # Code is NOT implemented - need to re-run dev
+                self.console.print("[red]✗ Code is NOT implemented![/red]")
+                if deep_result.get("deep_summary"):
+                    self.console.print(f"[dim]{deep_result['deep_summary']}[/dim]")
+                self.console.print()
+                self.console.print("[yellow]Re-running development...[/yellow]")
+
+                dev_result = self._run_dev_story(story_id)
+                if dev_result != 0:
+                    self.console.print(f"[yellow]Dev returned exit code {dev_result}[/yellow]")
+
+            # Check for stop signal
+            if Path(STOP_FILE).exists() or self.stop_event.is_set():
+                self.console.print("[yellow]Stop requested during verification[/yellow]")
+                return False
+
+        self.console.print(f"[red]✗ Failed to verify after {max_retries} attempts[/red]")
+        return False
+
     def _reset_iteration(self):
         """Reset state for new iteration"""
         self.step_status = {step["key"]: "pending" for step in STEPS}
@@ -447,11 +669,15 @@ class BMadRunner:
 
         # Show startup banner
         mode_text = "[yellow]DEMO MODE[/yellow] (simulated)" if self.demo_mode else "[green]PRODUCTION MODE[/green]"
+        story_text = f"[bold cyan]{self.manual_story_id}[/bold cyan]" if self.manual_story_id else "[dim]Auto (next backlog)[/dim]"
+        iter_text = "1 (single story)" if self.manual_story_id else str(self.max_iterations)
+
         self.console.print()
         self.console.print(Panel(
             f"[bold cyan]BMAD Story Automation[/bold cyan]\n\n"
             f"[white]Mode:[/white] {mode_text}\n"
-            f"[white]Max Iterations:[/white] [bold]{self.max_iterations}[/bold]\n"
+            f"[white]Story:[/white] {story_text}\n"
+            f"[white]Max Iterations:[/white] [bold]{iter_text}[/bold]\n"
             f"[white]Started:[/white] [bold]{self.start_time.strftime('%Y-%m-%d %H:%M:%S')}[/bold]\n\n"
             "[dim]Press Ctrl+C to stop at any time[/dim]",
             box=box.DOUBLE,
@@ -460,7 +686,10 @@ class BMadRunner:
         self.console.print()
         time.sleep(2)
 
-        for iteration in range(1, self.max_iterations + 1):
+        # If manual story, only run 1 iteration
+        max_iter = 1 if self.manual_story_id else self.max_iterations
+
+        for iteration in range(1, max_iter + 1):
             # Check stop condition
             if Path(STOP_FILE).exists() or self.stop_event.is_set():
                 self.console.print("[yellow]Stop requested. Exiting...[/yellow]")
@@ -511,6 +740,34 @@ class BMadRunner:
             else:
                 self.console.print(f"[yellow]⚠ Iteration {iteration} completed with exit code {exit_code}[/yellow]")
 
+            # === VERIFICATION LOOP ===
+            # After Claude finishes, verify the story was actually completed
+            completed_story_id = self.story_id
+            if completed_story_id and completed_story_id != "...":
+                self.console.print()
+                self.console.print(Panel(
+                    f"[bold cyan]📋 Post-Execution Verification[/bold cyan]\n\n"
+                    f"Verifying story [bold]{completed_story_id}[/bold] was completed correctly...",
+                    box=box.ROUNDED,
+                    border_style="cyan"
+                ))
+
+                if self.demo_mode:
+                    # In demo mode, skip real verification
+                    self.console.print("[dim]Demo mode: skipping actual verification[/dim]")
+                    verified = True
+                else:
+                    # Real verification loop
+                    verified = self._verify_and_fix_loop(completed_story_id)
+
+                if verified:
+                    self.console.print()
+                    self.console.print(f"[green]✓ Story {completed_story_id} verified as DONE![/green]")
+                else:
+                    self.console.print()
+                    self.console.print(f"[red]✗ Story {completed_story_id} could not be verified[/red]")
+                    self.console.print("[dim]Check manually or run verifier: python bmad-verifier.py {completed_story_id} -d -i[/dim]")
+
             # Check stop condition again
             if Path(STOP_FILE).exists():
                 self.console.print("[yellow]Stop file detected. Exiting...[/yellow]")
@@ -547,11 +804,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python bmad-runner.py                    # Run with default 5 iterations
+  python bmad-runner.py                    # Run with default 5 iterations (auto pick stories)
   python bmad-runner.py --iterations 3    # Run with 3 iterations
-  python bmad-runner.py -i 10             # Run with 10 iterations
+  python bmad-runner.py --story 5-2       # Process specific story only
+  python bmad-runner.py -s 5-2            # Short form for --story
   python bmad-runner.py --demo            # Demo mode (simulated, no Claude)
-  python bmad-runner.py --demo -i 2       # Demo with 2 iterations
+  python bmad-runner.py --demo -s 5-2     # Demo with specific story
 
 To stop the automation:
   - Press Ctrl+C
@@ -562,7 +820,13 @@ To stop the automation:
         "-i", "--iterations",
         type=int,
         default=5,
-        help="Maximum number of iterations (default: 5)"
+        help="Maximum number of iterations (default: 5, ignored if --story is set)"
+    )
+    parser.add_argument(
+        "-s", "--story",
+        type=str,
+        default=None,
+        help="Specific story ID to process (e.g. '5-2' or '5-2-my-story-name')"
     )
     parser.add_argument(
         "--demo",
@@ -572,7 +836,7 @@ To stop the automation:
 
     args = parser.parse_args()
 
-    runner = BMadRunner(max_iterations=args.iterations, demo_mode=args.demo)
+    runner = BMadRunner(max_iterations=args.iterations, demo_mode=args.demo, story_id=args.story)
     runner.run()
 
 
