@@ -437,8 +437,8 @@ class BMadSuite:
         script = SCRIPTS_DIR / "bmad-runner.py"
 
         if mode == "story":
-            # Single specific story
-            cmd = [sys.executable, str(script), "-s", story_id]
+            # Single specific story - limit to 1 iteration
+            cmd = [sys.executable, str(script), "-s", story_id, "-i", "1"]
         elif mode == "story_continue":
             # Start from story, continue for count iterations
             cmd = [sys.executable, str(script), "-s", story_id, "-i", str(count)]

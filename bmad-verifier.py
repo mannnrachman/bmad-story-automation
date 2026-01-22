@@ -116,10 +116,16 @@ class BMadVerifier:
         """Check if story matches the filter"""
         if not self.story_filter:
             return True
-        if "-" in self.story_filter:
-            return key.startswith(self.story_filter + "-")
-        else:
-            return key.startswith(self.story_filter + "-")
+        # Handle both short ID (9-9) and full ID matching
+        # Filter "9-9" should match "9-9-export-reports-to-pdf-and-csv"
+        if key == self.story_filter:
+            return True
+        if key.startswith(self.story_filter + "-"):
+            return True
+        # Also check if filter is a full ID that matches key
+        if self.story_filter.startswith(key.split("-")[0] + "-" + key.split("-")[1] if len(key.split("-")) >= 2 else key):
+            return key.startswith(self.story_filter.split("-")[0] + "-" + self.story_filter.split("-")[1] + "-") if len(self.story_filter.split("-")) >= 2 else False
+        return False
 
     def _parse_tasks_from_story(self, content: str) -> list:
         """Parse task list from story file content"""
@@ -135,9 +141,26 @@ class BMadVerifier:
             })
         return tasks
 
+    def _find_story_file(self, story_id: str) -> Path:
+        """Find story file by ID (handles both short and full IDs)"""
+        story_folder = Path(STORY_FOLDER)
+
+        # Try exact match first
+        exact_file = story_folder / f"{story_id}.md"
+        if exact_file.exists():
+            return exact_file
+
+        # Try glob pattern for short ID (e.g., "9-9" -> "9-9-*.md")
+        pattern = f"{story_id}-*.md"
+        matches = list(story_folder.glob(pattern))
+        if matches:
+            return matches[0]  # Return first match
+
+        return exact_file  # Return expected path even if not exists
+
     def _quick_validate(self, story_id: str, sprint_status: str) -> dict:
         """Quick validation without Claude"""
-        story_file = Path(STORY_FOLDER) / f"{story_id}.md"
+        story_file = self._find_story_file(story_id)
         result = {
             "id": story_id,
             "sprint_status": sprint_status,
@@ -220,7 +243,7 @@ class BMadVerifier:
 
     def _deep_validate_with_claude(self, story_id: str, result: dict) -> dict:
         """Deep validation using Claude to check if task code exists"""
-        story_file = Path(STORY_FOLDER) / f"{story_id}.md"
+        story_file = self._find_story_file(story_id)
 
         if not story_file.exists():
             return result

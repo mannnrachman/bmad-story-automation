@@ -23,6 +23,8 @@ from pathlib import Path
 from datetime import datetime
 from threading import Thread, Event
 
+import re
+
 try:
     from rich.console import Console
     from rich.panel import Panel
@@ -37,6 +39,16 @@ except ImportError:
     print("Missing dependencies. Please run:")
     print("  pip install rich")
     sys.exit(1)
+
+try:
+    import yaml
+except ImportError:
+    print("Missing dependencies. Please run:")
+    print("  pip install pyyaml")
+    sys.exit(1)
+
+# Sprint status file path
+SPRINT_STATUS_FILE = "_bmad-output/implementation-artifacts/sprint-status.yaml"
 
 # Constants
 PROGRESS_FILE = ".claude/bmad-progress.json"
@@ -76,7 +88,7 @@ After completing EACH step, write progress to .claude/bmad-progress.json:
 {"story_id": "X", "current_step": N, "status": "done", "message": "what you did"}
 
 STEP 1: Read _bmad-output/implementation-artifacts/sprint-status.yaml
-        Find first story with status "backlog" → save as STORY_ID
+        Find first story with status NOT "done" (can be backlog, in-progress, review, etc.) → save as STORY_ID
         Write progress with story_id
 
 STEP 2: Call /bmad:bmm:workflows:create-story with STORY_ID to create the story file
@@ -188,19 +200,65 @@ class BMadRunner:
         if hasattr(signal, 'SIGTERM'):
             signal.signal(signal.SIGTERM, self._signal_handler)
 
-    def _get_next_story_id(self, current_id: str) -> str:
-        """Calculate the next story ID (e.g., 5-10 -> 5-11)"""
-        if not current_id:
+    def _get_next_story_from_sprint(self) -> str:
+        """Read sprint-status.yaml and find the next story that is NOT done.
+
+        Stories are processed in order: epic 1 story 1, epic 1 story 2, ..., epic 2 story 1, etc.
+
+        Returns the full story ID (e.g., '8-2-display-source-schema-as-visual-diagram')
+        or None if all stories are done.
+        """
+        sprint_file = Path(SPRINT_STATUS_FILE)
+
+        if not sprint_file.exists():
+            self.console.print(f"[red]Error: {sprint_file} not found[/red]")
             return None
-        parts = current_id.split("-")
+
+        try:
+            with open(sprint_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+
+            dev_status = data.get("development_status", {})
+
+            # Pattern to match story IDs: X-Y-story-name (e.g., 8-2-display-source...)
+            story_pattern = re.compile(r'^(\d+)-(\d+)-(.+)$')
+
+            # Collect all stories with their epic and story numbers for sorting
+            stories = []
+            for key, status in dev_status.items():
+                match = story_pattern.match(key)
+                if match:
+                    epic_num = int(match.group(1))
+                    story_num = int(match.group(2))
+                    stories.append((epic_num, story_num, key, status))
+
+            # Sort by epic number, then story number (ensures correct order)
+            stories.sort(key=lambda x: (x[0], x[1]))
+
+            # Find first story that is NOT done
+            for epic_num, story_num, story_id, status in stories:
+                if status != "done":
+                    return story_id
+
+            # All stories are done
+            self.console.print("[green]✓ All stories are done![/green]")
+            return None
+
+        except yaml.YAMLError as e:
+            self.console.print(f"[red]Error parsing sprint-status.yaml: {e}[/red]")
+            return None
+        except Exception as e:
+            self.console.print(f"[red]Error reading sprint-status.yaml: {e}[/red]")
+            return None
+
+    def _get_short_story_id(self, full_story_id: str) -> str:
+        """Extract short story ID (e.g., '8-2' from '8-2-display-source-schema')"""
+        if not full_story_id:
+            return None
+        parts = full_story_id.split("-")
         if len(parts) >= 2:
-            try:
-                epic = parts[0]
-                story_num = int(parts[1])
-                return f"{epic}-{story_num + 1}"
-            except ValueError:
-                return None
-        return None
+            return f"{parts[0]}-{parts[1]}"
+        return full_story_id
 
     def _signal_handler(self, signum, frame):
         """Handle Ctrl+C gracefully"""
@@ -919,9 +977,18 @@ IMPORTANT: Complete ALL listed steps. Do not stop early. Do not ask questions - 
             self._reset_iteration()
             self.iteration_start_time = datetime.now()
 
+            # === FETCH STORY FROM YAML AT START OF ITERATION ===
+            # If no current story (first iteration without --story, or after completing previous)
+            if not self.current_story_id:
+                self.current_story_id = self._get_next_story_from_sprint()
+                if not self.current_story_id:
+                    self.console.print("[yellow]No stories to process. All done![/yellow]")
+                    break
+
             # Show current story being processed
-            if self.current_story_id:
-                self.console.print(f"\n[bold cyan]▶ Processing story: {self.current_story_id}[/bold cyan]")
+            short_id = self._get_short_story_id(self.current_story_id)
+            self.console.print(f"\n[bold cyan]▶ Processing story: {short_id}[/bold cyan]")
+            self.console.print(f"[dim]   Full ID: {self.current_story_id}[/dim]")
 
             # Save tracking info
             tracking = {
@@ -977,7 +1044,10 @@ IMPORTANT: Complete ALL listed steps. Do not stop early. Do not ask questions - 
                     else:
                         self.console.print(f"[red]✗ Could not complete all steps after retries[/red]")
             else:
-                self.console.print(f"[yellow]⚠ Iteration {iteration} completed with exit code {exit_code}[/yellow]")
+                # Exit code non-zero (e.g., -4) - stop automation
+                self.console.print(f"[red]✗ Iteration {iteration} FAILED with exit code {exit_code}[/red]")
+                self.console.print("[yellow]Stopping automation due to Claude error.[/yellow]")
+                break
 
             # === VERIFICATION LOOP ===
             # After Claude finishes, verify the story was actually completed
@@ -1006,6 +1076,9 @@ IMPORTANT: Complete ALL listed steps. Do not stop early. Do not ask questions - 
                     self.console.print()
                     self.console.print(f"[red]✗ Story {completed_story_id} could not be verified[/red]")
                     self.console.print("[dim]Check manually or run verifier: python bmad-verifier.py {completed_story_id} -d -i[/dim]")
+                    # Stop automation when verification fails - don't continue to next story
+                    self.console.print("[yellow]Stopping automation due to verification failure.[/yellow]")
+                    break
 
             # Check stop condition again
             if Path(STOP_FILE).exists():
@@ -1013,12 +1086,10 @@ IMPORTANT: Complete ALL listed steps. Do not stop early. Do not ask questions - 
                 Path(STOP_FILE).unlink(missing_ok=True)
                 break
 
-            # Increment story ID for next iteration (if in continue mode)
-            if self.current_story_id and iteration < self.max_iterations:
-                next_story = self._get_next_story_id(self.current_story_id)
-                if next_story:
-                    self.current_story_id = next_story
-                    self.console.print(f"[dim]Next story: {next_story}[/dim]")
+            # Get next story from sprint-status.yaml (always read from YAML)
+            # Clear current story so next iteration will fetch fresh from YAML
+            if iteration < self.max_iterations:
+                self.current_story_id = None  # Reset so next iteration fetches from YAML
 
             # Delay before next iteration
             if iteration < self.max_iterations:
